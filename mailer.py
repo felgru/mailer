@@ -19,6 +19,19 @@ import smtplib
 import ssl
 from string import Template
 from typing import cast, Literal
+import uuid
+
+
+@dataclass
+class SenderAddress:
+    email: str
+    name: str | None = None
+
+    def __str__(self) -> str:
+        if self.name is None:
+            return self.email
+        else:
+            return f'{self.name} <{self.email}>'
 
 
 class Templates:
@@ -43,7 +56,7 @@ class Templates:
                        template_name: str,
                        *,
                        content: dict[str, str],
-                       sender_address: str,
+                       sender_address: SenderAddress,
                        ) -> EmailMessage:
         try:
             formatted_to = '{firstname} {lastname} <{email}>'.format_map(content)
@@ -58,8 +71,12 @@ class Templates:
         msg = EmailMessage()
         msg.set_content(body)
         msg['Subject'] = subject
-        msg['From'] = sender_address
+        msg['From'] = str(sender_address)
         msg['To'] = formatted_to
+        from_email = sender_address.email
+        message_id = '<' + str(uuid.uuid4()) \
+                     + from_email[from_email.rfind('@'):] + '>'
+        msg['Message-ID'] = message_id
         return msg
 
 
@@ -68,16 +85,16 @@ class SMTPSender:
         config = configparser.ConfigParser()
         config.read(cfg_file)
         sender_config = config['sender']
-        self.name = sender_config['name']
-        self.email = sender_config['email']
-        self.sender_address = f'{self.name} <{self.email}>'
+        name = sender_config['name']
+        email = sender_config['email']
+        self.sender_address = SenderAddress(email=email, name=name)
         self.smtpserver = sender_config['smtpserver']
-        self.smtpuser = sender_config.get('smtpuser', self.email)
+        self.smtpuser = sender_config.get('smtpuser', email)
         self.smtpport = int(sender_config.get('smtpport', '587'))
         self.smtp = smtplib.SMTP(self.smtpserver, self.smtpport)
 
     def login(self) -> None:
-        password = getpass(f'Password for {self.email}: ')
+        password = getpass(f'Password for {self.sender_address.email}: ')
         context = ssl.create_default_context()
         self.smtp.starttls(context=context)
         self.smtp.login(self.smtpuser, password)
@@ -96,7 +113,7 @@ class SMTPSender:
         self.quit()
 
 
-def read_sender_address(csv_path: Path) -> str:
+def read_sender_address(csv_path: Path) -> SenderAddress:
     sender_path = csv_path.with_name(csv_path.stem + '-sender.ini')
     if not sender_path.exists():
         raise RuntimeError(f'Please configure sender in file {sender_path}.')
@@ -105,8 +122,7 @@ def read_sender_address(csv_path: Path) -> str:
     sender_config = config['sender']
     name = sender_config['name']
     email = sender_config['email']
-    sender_address = f'{name} <{email}>'
-    return sender_address
+    return SenderAddress(email=email, name=name)
 
 
 def check_csv(args: argparse.Namespace) -> None:
