@@ -17,13 +17,14 @@ import json
 from pathlib import Path
 import smtplib
 import ssl
+import subprocess
 from string import Template
-from typing import cast, Literal
+from typing import cast, Literal, Protocol
 import uuid
 
 
 @dataclass
-class SenderAddress:
+class DisplayAddress:
     email: str
     name: str | None = None
 
@@ -32,6 +33,26 @@ class SenderAddress:
             return self.email
         else:
             return f'{self.name} <{self.email}>'
+
+
+@dataclass
+class Email:
+    subject: str
+    body: str
+    from_address: DisplayAddress
+    to_address: DisplayAddress
+
+    def as_mime(self) -> EmailMessage:
+        msg = EmailMessage()
+        msg.set_content(self.body)
+        msg['Subject'] = self.subject
+        msg['From'] = str(self.from_address)
+        msg['To'] = str(self.to_address)
+        from_email = self.from_address.email
+        message_id = '<' + str(uuid.uuid4()) \
+                     + from_email[from_email.rfind('@'):] + '>'
+        msg['Message-ID'] = message_id
+        return msg
 
 
 class Templates:
@@ -56,12 +77,13 @@ class Templates:
                        template_name: str,
                        *,
                        content: dict[str, str],
-                       sender_address: SenderAddress,
-                       ) -> EmailMessage:
+                       sender_address: DisplayAddress,
+                       ) -> Email:
         try:
-            formatted_to = '{firstname} {lastname} <{email}>'.format_map(content)
+            to_name = '{firstname} {lastname}'.format_map(content)
         except KeyError:
-            formatted_to = content['email']
+            to_name = None
+        to_address = DisplayAddress(name=to_name, email=content['email'])
         filled = self[template_name].substitute(content)
         if not filled.startswith('Subject: '):
             raise RuntimeError(f'Missing Subject line in template {template_name}.')
@@ -72,25 +94,36 @@ class Templates:
         msg.set_content(body)
         msg['Subject'] = subject
         msg['From'] = str(sender_address)
-        msg['To'] = formatted_to
-        from_email = sender_address.email
-        message_id = '<' + str(uuid.uuid4()) \
-                     + from_email[from_email.rfind('@'):] + '>'
-        msg['Message-ID'] = message_id
-        return msg
+        msg['To'] = to_address
+        return Email(
+                subject=subject,
+                body=body,
+                from_address=sender_address,
+                to_address=to_address,
+                )
+
+
+class Sender(Protocol):
+    def login(self) -> None: ...
+    def send_message(self, msg: Email) -> None: ...
+    def quit(self) -> None: ...
+    def __enter__(self) -> Sender: ...
+    def __exit__(self, exc_type, exc_value, traceback) -> None: ...
+
+    @property
+    def sender_address(self) -> DisplayAddress: ...
 
 
 class SMTPSender:
-    def __init__(self, cfg_file: Path):
-        config = configparser.ConfigParser()
-        config.read(cfg_file)
-        sender_config = config['sender']
-        name = sender_config['name']
-        email = sender_config['email']
-        self.sender_address = SenderAddress(email=email, name=name)
-        self.smtpserver = sender_config['smtpserver']
-        self.smtpuser = sender_config.get('smtpuser', email)
-        self.smtpport = int(sender_config.get('smtpport', '587'))
+    def __init__(self,
+                 sender_address: DisplayAddress,
+                 smtpserver: str,
+                 smtpuser: str,
+                 smtpport: int):
+        self.sender_address = sender_address
+        self.smtpserver = smtpserver
+        self.smtpuser = smtpuser
+        self.smtpport = smtpport
         self.smtp = smtplib.SMTP(self.smtpserver, self.smtpport)
 
     def login(self) -> None:
@@ -99,8 +132,8 @@ class SMTPSender:
         self.smtp.starttls(context=context)
         self.smtp.login(self.smtpuser, password)
 
-    def send_message(self, msg: EmailMessage) -> None:
-        self.smtp.send_message(msg)
+    def send_message(self, msg: Email) -> None:
+        self.smtp.send_message(msg.as_mime())
 
     def quit(self) -> None:
         self.smtp.quit()
@@ -113,7 +146,64 @@ class SMTPSender:
         self.quit()
 
 
-def read_sender_address(csv_path: Path) -> SenderAddress:
+class ThunderbirdSender:
+    def __init__(self,
+                 sender_address: DisplayAddress):
+        self.sender_address = sender_address
+
+    def login(self) -> None:
+        pass
+
+    def send_message(self, msg: Email) -> None:
+        options = {'to': str(msg.to_address),
+                   'from': str(msg.from_address),
+                   'subject': msg.subject,
+                   'body': msg.body,
+                   #'format': 'text',
+                   }
+        command = ['thunderbird', '-compose',
+                        ','.join(f"{key}='{value}'"
+                                 for key, value in options.items())]
+        subprocess.run(command)
+        reply = input('email sent [Y/n]? ').strip().lower()
+        if not reply or reply == 'y':
+            # Sent successfully
+            return
+        elif reply == 'n':
+            raise RuntimeError('You said that you didn\'t sent the email.')
+        else:
+            raise RuntimeError(f'Unexpected reply: {reply!r}')
+
+    def quit(self) -> None:
+        pass
+
+    def __enter__(self) -> ThunderbirdSender:
+        self.login()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.quit()
+
+
+def create_sender(cfg_file: Path) -> Sender:
+    config = configparser.ConfigParser()
+    config.read(cfg_file)
+    sender_config = config['sender']
+    name = sender_config['name']
+    email = sender_config['email']
+    sender_address = DisplayAddress(email=email, name=name)
+    smtpserver = sender_config.get('smtpserver')
+    if smtpserver is None:
+        return ThunderbirdSender(sender_address=sender_address)
+    smtpuser = sender_config.get('smtpuser', email)
+    smtpport = int(sender_config.get('smtpport', '587'))
+    return SMTPSender(sender_address=sender_address,
+                      smtpserver=smtpserver,
+                      smtpuser=smtpuser,
+                      smtpport=smtpport)
+
+
+def read_sender_address(csv_path: Path) -> DisplayAddress:
     sender_path = csv_path.with_name(csv_path.stem + '-sender.ini')
     if not sender_path.exists():
         raise RuntimeError(f'Please configure sender in file {sender_path}.')
@@ -122,7 +212,7 @@ def read_sender_address(csv_path: Path) -> SenderAddress:
     sender_config = config['sender']
     name = sender_config['name']
     email = sender_config['email']
-    return SenderAddress(email=email, name=name)
+    return DisplayAddress(email=email, name=name)
 
 
 def check_csv(args: argparse.Namespace) -> None:
@@ -231,7 +321,7 @@ def send_all_emails(args: argparse.Namespace) -> None:
                 status[log_entry.email] = log_entry
     with (open(csv_path, newline='') as csvfile,
           send_log_path.open('a') as log_file,
-          SMTPSender(sender_path) as smtp):
+          create_sender(sender_path) as sender):
         reader = csv.DictReader(csvfile)
         for row in reader:
             to = row['email']
@@ -241,10 +331,10 @@ def send_all_emails(args: argparse.Namespace) -> None:
                 msg = templates.create_message(
                         row['template'],
                         content=row,
-                        sender_address=smtp.sender_address,
+                        sender_address=sender.sender_address,
                 )
                 # print(msg)
-                smtp.send_message(msg)
+                sender.send_message(msg)
                 print(f'Sent to {to}')
             except Exception as e:
                 log_file.write(LogEntry.failure(email=to, reason=str(e))
